@@ -1,20 +1,15 @@
 #!/usr/bin/env node
 /**
- * V2Ray Rotation Daemon
+ * V2Ray Rotation Daemon v2 — 9Router Isolated
  * 
- * Standalone daemon that:
- * 1. Fetches free v2ray/vless/trojan nodes from GitHub sources
- * 2. Builds dynamic Xray config with per-port HTTP proxies
- * 3. Reloads Xray
- * 4. Syncs proxy pools to 9router's db.json
- * 5. Assigns unique IPs to each 9router connection
- * 6. Runs on a timer to keep nodes fresh
+ * Fetches free v2ray/socks5/http nodes → routes through Xray HTTP proxies
+ * Assigns ONE unique external IP per 9router connection.
  * 
- * NO dependency on 9router's API — works directly with db.json and Xray.
+ * ISOLATION: Only touches ~/.9router/db.json and /usr/local/etc/xray/config.json
  */
 
-const { exec, execSync, spawn } = require("child_process");
-const { readFileSync, writeFileSync, existsSync } = require("fs");
+const { exec, execSync } = require("child_process");
+const { readFileSync, writeFileSync } = require("fs");
 const { join } = require("path");
 const { createHash } = require("crypto");
 const crypto = require("crypto");
@@ -23,15 +18,17 @@ const crypto = require("crypto");
 
 const DB_PATH = join(process.env.HOME, ".9router", "db.json");
 const XRAY_CONFIG = "/usr/local/etc/xray/config.json";
-const XRAY_BIN = "/usr/local/bin/xray";
 const BASE_HTTP_PORT = 10810;
 const TEST_URL = "https://httpbin.org/ip";
 const TEST_TIMEOUT = 8000;
-const CYCLE_INTERVAL_MS = 3600000;     // 1 hour: full refresh
-const HEALTH_INTERVAL_MS = 300000;      // 5 min: test pools
-const MAX_NODES_PER_SOURCE = 30;
-const MAX_TOTAL_NODES = 40;            // Cap total nodes to avoid Xray overload
+const CYCLE_INTERVAL_MS = 3600000;      // 1 hour: full refresh
+const HEALTH_INTERVAL_MS = 300000;       // 5 min: health check
+const MAX_NODES_PER_SOURCE = 40;
+const MAX_TOTAL_NODES = 80;              // Xray can handle 80+ nodes
+const MIN_HEALTHY_NODES = 10;            // Below this, trigger emergency refresh
+const EMERGENCY_REFRESH_MS = 300000;     // 5 min refresh when low
 
+// All free proxy sources — v2ray/ss/trojan/vless
 const SUBSCRIPTION_SOURCES = [
   { name: "Pawdroid", url: "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub" },
   { name: "Ermaozi", url: "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt" },
@@ -39,6 +36,8 @@ const SUBSCRIPTION_SOURCES = [
   { name: "Aiboboxx", url: "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2" },
   { name: "NoMoreWalls", url: "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt" },
   { name: "Roozk", url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt" },
+  { name: "Ts-sf", url: "https://raw.githubusercontent.com/ts-sf/fly/main/v2" },
+  { name: "Peasoft2", url: "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml" },
 ];
 
 let state = {
@@ -47,13 +46,14 @@ let state = {
   poolMap: {},       // poolId → { port, name, ip }
   running: false,
   cycleCount: 0,
+  lastHealthyCount: 0,
 };
 
 const log = (level, ...args) => {
   console.log(`[${new Date().toISOString()}][${level.toUpperCase()}]`, ...args);
 };
 
-// ─── DB Helpers ─────────────────────────────────────────────────────────────
+// ─── DB Helpers (9router ONLY) ──────────────────────────────────────────────
 
 function loadDB() {
   return JSON.parse(readFileSync(DB_PATH, "utf-8"));
@@ -82,7 +82,6 @@ async function fetchURL(url) {
 }
 
 function decodeSubscription(text) {
-  // Try base64 decode first
   try {
     const decoded = Buffer.from(text.trim(), "base64").toString("utf-8");
     if (decoded.includes("://")) return decoded;
@@ -182,7 +181,7 @@ function parseShadowsocks(url) {
       const password = decoded.substring(colonIdx + 1);
       const [host, port] = inner.substring(atIdx + 1).split(":");
       
-      // Filter out unsupported ciphers in Xray v26+
+      // Filter unsupported ciphers for Xray v26+
       const unsupported = ["aes-256-cfb", "aes-128-cfb", "rc4-md5", "chacha20", "salsa20"];
       if (unsupported.includes(method.toLowerCase())) return null;
       
@@ -221,8 +220,6 @@ async function fetchAllNodes() {
       const node = parseShareUrl(url);
       if (!node) continue;
       seenUrls.add(url);
-      
-      // Deduplicate tags
       node.tag = `${node.tag}-${createHash("md5").update(url).digest("hex").slice(0, 6)}`;
       allNodes.push(node);
       parsed++;
@@ -230,12 +227,18 @@ async function fetchAllNodes() {
     log("info", `  ${source.name}: ${parsed} nodes`);
   }
 
+  // Shuffle for diversity (avoid same sources always on top)
+  for (let i = allNodes.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [allNodes[i], allNodes[j]] = [allNodes[j], allNodes[i]];
+  }
+
   log("info", `Total unique nodes: ${allNodes.length}`);
   const byProtocol = {};
   for (const n of allNodes) byProtocol[n.protocol] = (byProtocol[n.protocol] || 0) + 1;
   log("info", `  By protocol: ${JSON.stringify(byProtocol)}`);
   
-  // Cap total nodes
+  // Cap total
   if (allNodes.length > MAX_TOTAL_NODES) {
     log("info", `  Capping to ${MAX_TOTAL_NODES} nodes (from ${allNodes.length})`);
     return allNodes.slice(0, MAX_TOTAL_NODES);
@@ -251,7 +254,7 @@ function buildXrayConfig(nodes) {
   const outbounds = [];
   const rules = [];
 
-  // SOCKS inbound
+  // SOCKS inbound (general purpose)
   inbounds.push({
     port: 10808, listen: "127.0.0.1", protocol: "socks",
     settings: { auth: "noauth", udp: true }, tag: "socks-in"
@@ -362,9 +365,7 @@ function syncProxyPools(nodes, testResults) {
   
   const now = new Date().toISOString();
   const portSet = new Set();
-  const created = [];
-  const updated = [];
-  const deactivated = [];
+  let created = 0, updated = 0, deactivated = 0;
 
   for (let i = 0; i < nodes.length; i++) {
     const port = BASE_HTTP_PORT + i;
@@ -373,8 +374,8 @@ function syncProxyPools(nodes, testResults) {
     portSet.add(portKey);
 
     const poolUrl = `http://127.0.0.1:${port}`;
+    const testStatus = testResults[i]?.status === "active" ? "active" : "error";
     const testName = testResults[i]?.externalIP || "unknown";
-    const testStatus = testResults[i]?.status === "active" ? "active" : "unknown";
 
     // Find existing pool for this port
     const existingIdx = db.proxyPools.findIndex(p => p.name === `xray-${node.tag}` || p._portKey === portKey);
@@ -389,12 +390,14 @@ function syncProxyPools(nodes, testResults) {
         strictProxy: false,
         testStatus,
         lastTestedAt: now,
+        lastError: testResults[i]?.status === "error" ? testResults[i]?.error : null,
+        _lastIP: testResults[i]?.externalIP || db.proxyPools[existingIdx]._lastIP || "unknown",
         _portKey: portKey,
         updatedAt: now
       };
-      updated.push({ port, tag: node.tag, ip: testResults[i]?.externalIP });
+      updated++;
       state.portMap[port] = db.proxyPools[existingIdx].id;
-      state.poolMap[db.proxyPools[existingIdx].id] = { port, name: node.tag, ip: testName };
+      state.poolMap[db.proxyPools[existingIdx].id] = { port, name: node.tag, ip: db.proxyPools[existingIdx]._lastIP };
     } else {
       const id = uuid();
       const pool = {
@@ -408,86 +411,109 @@ function syncProxyPools(nodes, testResults) {
         testStatus,
         lastTestedAt: now,
         lastError: null,
+        _lastIP: testResults[i]?.externalIP || "unknown",
         _portKey: portKey,
         createdAt: now,
         updatedAt: now
       };
       db.proxyPools.push(pool);
-      created.push({ port, tag: node.tag, ip: testName });
+      created++;
       state.portMap[port] = id;
-      state.poolMap[id] = { port, name: node.tag, ip: testName };
+      state.poolMap[id] = { port, name: node.tag, ip: pool._lastIP };
     }
   }
 
-  // Deactivate stale pools (not in current node set)
+  // Deactivate stale pools not in current node set
   for (const pool of db.proxyPools) {
     if (pool.type === "xray" && !portSet.has(pool._portKey)) {
-      // Only deactivate if no connection is using it
       const inUse = db.providerConnections?.some(c => c.providerSpecificData?.proxyPoolId === pool.id);
       if (!inUse) {
         pool.isActive = false;
-        deactivated.push(pool.name);
+        deactivated++;
       }
     }
   }
 
   saveDB(db);
-  return { created: created.length, updated: updated.length, deactivated: deactivated.length };
+  return { created, updated, deactivated };
 }
 
-function assignUniquePools() {
+// ─── Unique IP Assignment ───────────────────────────────────────────────────
+
+function assignUniqueIPs() {
   const db = loadDB();
   const connections = db.providerConnections || [];
   const activeConns = connections.filter(c => c.isActive);
   const allXrayPools = (db.proxyPools || []).filter(p => p.type === "xray" && p.isActive !== false);
-  const healthyPools = allXrayPools.filter(p => p.testStatus === "active");
+  // Only pools with known good IPs (tested and returned an IP)
+  const knownIPPools = allXrayPools.filter(p => p._lastIP && p._lastIP !== "unknown");
+  const healthyIPPools = knownIPPools.filter(p => p.testStatus === "active");
 
-  if (allXrayPools.length === 0) {
-    log("warn", "No active Xray pools to assign");
-    return { assigned: 0, failed: activeConns.length, totalConns: activeConns.length, totalPools: 0 };
+  if (knownIPPools.length === 0) {
+    log("warn", "No pools with known IPs to assign");
+    return { assigned: 0, failed: activeConns.length, totalConns: activeConns.length, totalPools: 0, uniqueIPs: 0 };
   }
 
-  // Pass both sets: use allXrayPools for preserving existing assignments,
-  // prefer healthy pools for new assignments
-  return assignWithPools(allXrayPools, healthyPools, activeConns, db);
-}
-
-function assignWithPools(allPools, healthyPools, activeConns, db) {
-  let assigned = 0;
-  let failed = 0;
+  // First pass: validate existing assignments
+  const ipDistribution = {};
   const usedPoolIds = new Set();
+  let validExisting = 0;
+  let staleAssigned = 0;
 
   for (const conn of activeConns) {
     const existingPoolId = conn.providerSpecificData?.proxyPoolId;
-
     if (existingPoolId) {
-      // Keep existing assignment as long as the pool is still active
-      const stillActive = allPools.find(p => p.id === existingPoolId);
-      if (stillActive) {
+      const pool = allXrayPools.find(p => p.id === existingPoolId);
+      if (pool && pool._lastIP && pool._lastIP !== "unknown") {
         usedPoolIds.add(existingPoolId);
-        continue; // Keep it
+        ipDistribution[pool._lastIP] = (ipDistribution[pool._lastIP] || 0) + 1;
+        validExisting++;
+      } else {
+        // Stale/dead pool - clear and reassign
+        delete conn.providerSpecificData.proxyPoolId;
+        staleAssigned++;
       }
-      // Pool is gone - clear and reassign
-      delete conn.providerSpecificData.proxyPoolId;
     }
+  }
 
-    // Assign a healthy pool (prefer unused, cycle if needed)
-    const available = healthyPools.length > 0 ? healthyPools : allPools;
+  // Second pass: assign unassigned connections from known-IP pools first
+  let newAssigned = 0;
+  for (const conn of activeConns) {
+    if (conn.providerSpecificData?.proxyPoolId) continue;
+
+    // Try healthy pools with known IPs first (best case: unique IP)
+    const available = healthyIPPools.length > 0 ? healthyIPPools : knownIPPools;
     let pool = available.find(p => !usedPoolIds.has(p.id));
-    if (!pool) pool = available[assigned % available.length];
+    
+    // If no known-IP pool available, fall back to any active pool
+    if (!pool && allXrayPools.length > 0) {
+      pool = allXrayPools.find(p => !usedPoolIds.has(p.id));
+    }
+    
+    if (!pool) pool = available[newAssigned % (available.length || 1)] || allXrayPools[newAssigned % allXrayPools.length];
 
     if (pool) {
       conn.providerSpecificData = { ...(conn.providerSpecificData || {}), proxyPoolId: pool.id };
       usedPoolIds.add(pool.id);
-      assigned++;
-    } else {
-      failed++;
+      const ip = (pool._lastIP && pool._lastIP !== "unknown") ? pool._lastIP : `unknown (${pool.name.slice(0, 20)})`;
+      ipDistribution[ip] = (ipDistribution[ip] || 0) + 1;
+      newAssigned++;
     }
   }
 
   saveDB(db);
-  const uniqueUsed = new Set(Object.values(state.poolMap || {}).map(p => p?.poolId)).size;
-  return { assigned, failed: activeConns.length - (activeConns.filter(c => c.providerSpecificData?.proxyPoolId && allPools.find(p => p.id === c.providerSpecificData.proxyPoolId)).length), totalConns: activeConns.length, totalPools: healthyPools.length };
+  
+  const totalAssigned = validExisting + newAssigned;
+  const uniqueIPs = Object.keys(ipDistribution).filter(k => !k.startsWith("unknown")).length;
+  
+  return { 
+    assigned: totalAssigned, 
+    failed: activeConns.length - totalAssigned, 
+    totalConns: activeConns.length, 
+    totalPools: knownIPPools.length,
+    uniqueIPs,
+    ipDistribution
+  };
 }
 
 // ─── Main Cycle ─────────────────────────────────────────────────────────────
@@ -526,21 +552,28 @@ async function runCycle() {
     const dead = testResults.filter(r => r.status === "error").length;
     const uniqueIPs = new Set(testResults.filter(r => r.externalIP).map(r => r.externalIP)).size;
     log("info", `Test results: ${healthy} healthy, ${dead} dead, ${uniqueIPs} unique IPs`);
+    state.lastHealthyCount = healthy;
 
     // Step 4: Sync proxy pools to 9router
     const syncResult = syncProxyPools(nodes, testResults);
     log("info", `DB sync: ${syncResult.created} created, ${syncResult.updated} updated, ${syncResult.deactivated} deactivated`);
 
     // Step 5: Assign unique IPs to connections
-    const assignResult = assignUniquePools();
-    log("info", `Assignment: ${assignResult.assigned} assigned, ${assignResult.failed} failed (${assignResult.totalConns} conns, ${assignResult.totalPools} pools)`);
+    const assignResult = assignUniqueIPs();
+    log("info", `Assignment: ${assignResult.assigned}/${assignResult.totalConns} connections routed through ${assignResult.uniqueIPs} unique IPs`);
 
     // Summary
     log("info", `=== Cycle #${state.cycleCount} complete ===`);
     log("info", `  Nodes: ${nodes.length} deployed`);
-    log("info", `  Health: ${healthy}/${nodes.length} pools healthy, ${uniqueIPs} unique IPs`);
-    log("info", `  DB: ${syncResult.created + syncResult.updated} pools synced`);
-    log("info", `  Connections: ${assignResult.assigned}/${assignResult.totalConns} assigned`);
+    log("info", `  Health: ${healthy}/${nodes.length} pools healthy`);
+    log("info", `  Connections: ${assignResult.assigned}/${assignResult.totalConns} assigned to ${assignResult.uniqueIPs} unique IPs`);
+
+    if (assignResult.ipDistribution) {
+      log("info", "  IP distribution:");
+      for (const [ip, count] of Object.entries(assignResult.ipDistribution).sort((a, b) => b[1] - a[1])) {
+        log("info", `    ${ip}: ${count} connection(s)`);
+      }
+    }
 
     state.deployedNodes = nodes;
   } catch (err) {
@@ -553,11 +586,12 @@ async function runCycle() {
 // ─── Scheduler ──────────────────────────────────────────────────────────────
 
 function startScheduler() {
-  log("info", "Starting V2Ray Rotation Daemon");
+  log("info", "=== V2Ray Rotation Daemon (9Router Isolated) ===");
   log("info", `  Node refresh: every ${CYCLE_INTERVAL_MS / 60000}min`);
   log("info", `  Health check: every ${HEALTH_INTERVAL_MS / 60000}min`);
   log("info", `  DB: ${DB_PATH}`);
   log("info", `  Xray: ${XRAY_CONFIG}`);
+  log("info", `  Max nodes: ${MAX_TOTAL_NODES}`);
 
   // Initial cycle
   runCycle();
@@ -583,6 +617,7 @@ function startScheduler() {
         db.proxyPools[idx].testStatus = result.status === "active" ? "active" : "error";
         db.proxyPools[idx].lastTestedAt = new Date().toISOString();
         if (result.status === "active") {
+          db.proxyPools[idx]._lastIP = result.externalIP || db.proxyPools[idx]._lastIP;
           db.proxyPools[idx].lastError = null;
           healthy++;
         } else {
@@ -593,6 +628,13 @@ function startScheduler() {
     
     saveDB(db);
     log("info", `[Health check] ${healthy}/${pools.length} pools healthy`);
+    state.lastHealthyCount = healthy;
+
+    // Emergency refresh if too few healthy
+    if (healthy < MIN_HEALTHY_NODES && !state.running) {
+      log("warn", `Only ${healthy} healthy pools (< ${MIN_HEALTHY_NODES}), triggering emergency refresh`);
+      runCycle();
+    }
   }, HEALTH_INTERVAL_MS);
 }
 
@@ -601,24 +643,25 @@ function startScheduler() {
 const args = process.argv.slice(2);
 
 if (args.includes("run")) {
-  // Single run
   runCycle().then(() => {
     log("info", "Single cycle complete");
     process.exit(0);
   });
 } else if (args.includes("status")) {
-  // Show status
   const db = loadDB();
   const pools = (db.proxyPools || []).filter(p => p.type === "xray");
   const conns = (db.providerConnections || []).filter(c => c.isActive);
   const assigned = conns.filter(c => c.providerSpecificData?.proxyPoolId);
+  const healthy = pools.filter(p => p.isActive && p.testStatus === "active");
+  const uniqueIPs = new Set(healthy.map(p => p.proxyUrl.split(":").pop())).size;
   
-  console.log("V2Ray Rotation Status");
-  console.log(`  Xray pools: ${pools.length} (${pools.filter(p => p.isActive).length} active)`);
+  console.log("=== V2Ray Rotation Status (9Router Isolated) ===");
+  console.log(`  Xray pools: ${pools.length} (${pools.filter(p => p.isActive).length} active, ${healthy.length} healthy)`);
+  console.log(`  Unique IPs: ${uniqueIPs}`);
   console.log(`  Connections: ${conns.length} total, ${assigned.length} with proxy pool assigned`);
-  console.log(`  Daemon running: ${state.running}`);
+  console.log(`  Daemon cycles: ${state.cycleCount}, last healthy: ${state.lastHealthyCount}`);
+  console.log(`  Sources: ${SUBSCRIPTION_SOURCES.length}, max nodes: ${MAX_TOTAL_NODES}`);
 } else if (args.includes("test")) {
-  // Test all active pools
   (async () => {
     const db = loadDB();
     const pools = (db.proxyPools || []).filter(p => p.type === "xray" && p.isActive !== false);
@@ -627,14 +670,14 @@ if (args.includes("run")) {
       if (!match) continue;
       const port = parseInt(match[1]);
       const result = await testPort(port);
-      console.log(`  Port ${port} (${pool.name}): ${result.status} ${result.externalIP ? `→ ${result.externalIP}` : result.error || ""} (${result.latency}ms)`);
+      const ip = result.externalIP || result.error || "";
+      console.log(`  Port ${port} (${pool.name}): ${result.status} → ${ip} (${result.latency}ms)`);
     }
   })();
 } else {
   // Daemon mode
   startScheduler();
   
-  // Keep process alive
   process.on("SIGINT", () => { log("info", "Daemon stopping"); process.exit(0); });
   process.on("SIGTERM", () => { log("info", "Daemon stopping"); process.exit(0); });
 }
