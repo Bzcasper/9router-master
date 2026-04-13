@@ -72,6 +72,16 @@ const defaultData = {
     outboundProxyUrl: "",
     outboundNoProxy: "",
     mitmRouterBaseUrl: DEFAULT_MITM_ROUTER_BASE,
+    // Proxy rotation settings
+    enableProxyRotation: false,
+    proxyRotationStrategy: "sticky",
+    proxyRotationIntervalMs: 3600000,
+    proxyHealthCheckIntervalMs: 300000,
+    proxyFetchIntervalMs: 3600000,
+    proxyMinHealthyCount: 2,
+    proxyMaxFailures: 3,
+    proxyAutoFetchEnabled: true,
+    proxyAutoFetchIntervalMs: 3600000,
   },
   pricing: {} // NEW: pricing configuration
 };
@@ -110,6 +120,16 @@ function cloneDefaultData() {
       outboundProxyUrl: "",
       outboundNoProxy: "",
       mitmRouterBaseUrl: DEFAULT_MITM_ROUTER_BASE,
+      // Proxy rotation settings
+      enableProxyRotation: false,
+      proxyRotationStrategy: "sticky",
+      proxyRotationIntervalMs: 3600000,
+      proxyHealthCheckIntervalMs: 300000,
+      proxyFetchIntervalMs: 3600000,
+      proxyMinHealthyCount: 2,
+      proxyMaxFailures: 3,
+      proxyAutoFetchEnabled: true,
+      proxyAutoFetchIntervalMs: 3600000,
     },
     pricing: {},
   };
