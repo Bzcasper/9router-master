@@ -2,7 +2,8 @@ import { cleanupProviderConnections, getSettings, updateSettings, getApiKeys } f
 import { enableTunnel, isTunnelManuallyDisabled, isTunnelReconnecting } from "@/lib/tunnel/tunnelManager";
 import { killCloudflared, isCloudflaredRunning, ensureCloudflared } from "@/lib/tunnel/cloudflared";
 import { getMitmStatus, startMitm, loadEncryptedPassword, initDbHooks } from "@/mitm/manager";
-import { startProxyRotationScheduler, stopProxyRotationScheduler } from "@/lib/network/rotationScheduler.js";
+import { startProxyRotationScheduler } from "@/lib/network/rotationScheduler.js";
+import { startV2RayRotation } from "@/lib/v2ray/v2rayRotationScheduler.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { existsSync } from "fs";
@@ -96,8 +97,11 @@ export async function initializeApp() {
     // Auto-start MITM if it was enabled before restart
     autoStartMitm();
 
-    // Auto-start proxy rotation if enabled
+    // Auto-start generic proxy rotation if enabled
     startProxyRotationScheduler();
+
+    // Auto-start V2Ray rotation (Xray-backed proxy pools) if enabled
+    startV2RayRotation();
   } catch (error) {
     console.error("[InitApp] Error:", error);
   }

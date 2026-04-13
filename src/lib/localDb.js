@@ -82,6 +82,14 @@ const defaultData = {
     proxyMaxFailures: 3,
     proxyAutoFetchEnabled: true,
     proxyAutoFetchIntervalMs: 3600000,
+    // V2Ray/Xray rotation settings (Xray-backed proxy pools)
+    v2rayRotationEnabled: false,
+    v2rayRefreshIntervalMs: 3600000,
+    v2rayTestIntervalMs: 300000,
+    v2rayAssignIntervalMs: 3600000,
+    v2rayMaxPerSource: 60,
+    v2rayMinNodes: 4,
+    v2rayNodeTypes: ["vmess", "vless", "trojan", "shadowsocks"],
   },
   pricing: {} // NEW: pricing configuration
 };
@@ -130,6 +138,14 @@ function cloneDefaultData() {
       proxyMaxFailures: 3,
       proxyAutoFetchEnabled: true,
       proxyAutoFetchIntervalMs: 3600000,
+      // V2Ray/Xray rotation settings
+      v2rayRotationEnabled: false,
+      v2rayRefreshIntervalMs: 3600000,
+      v2rayTestIntervalMs: 300000,
+      v2rayAssignIntervalMs: 3600000,
+      v2rayMaxPerSource: 60,
+      v2rayMinNodes: 4,
+      v2rayNodeTypes: ["vmess", "vless", "trojan", "shadowsocks"],
     },
     pricing: {},
   };
