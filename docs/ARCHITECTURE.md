@@ -483,7 +483,53 @@ Translations are selected dynamically based on source payload shape and provider
 
 ## Failure Modes and Resilience
 
-## 1) Account/Provider Availability
+## 1) Account/Provider Availabilitytrap@trap-Latitude-5520:~/Downloads/9router-master$ #!/usr/bin/env bash
+# 1. Export n8n JSON
+pnpm --prefix content-system/n8n install @n8n-as-code/transformer
+npx ts-node content-system/n8n/export-n8n-workflows.ts
+
+# 2. Move old pipeline run artefacts >30d to archive
+find content-system/pipeline -type f -mtime +30 -exec bash -c '
+  dst="content-system/pipeline/runs/$(date -r "$1" +%F)";
+  mkdir -p "$dst";
+  mv "$1" "$dst/";' _ {} \;
+
+# 3. Clean trash (keep last 5 items)
+ls -t trash/* | tail -n +6 | xargs -r trash
+
+echo "Workspace tidy‑up complete."
+ ERROR  ENOENT: no such file or directory, lstat '/home/trap/Downloads/9router-master/content-system'
+For help, run: pnpm help add
+node:internal/modules/cjs/loader:1459
+  throw err;
+  ^
+
+Error: Cannot find module './export-n8n-workflows.ts'
+Require stack:
+- /home/trap/Downloads/9router-master/content-system/n8n/imaginaryUncacheableRequireResolveScript
+    at Module._resolveFilename (node:internal/modules/cjs/loader:1456:15)
+    at require.resolve (node:internal/modules/helpers:163:19)
+    at requireResolveNonCached (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:549:16)
+    at getProjectSearchDir (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:519:40)
+    at phase3 (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:267:27)
+    at bootstrap (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:47:30)
+    at main (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:33:12)
+    at Object.<anonymous> (/home/trap/.local/share/fnm/node-versions/v24.14.1/installation/lib/node_modules/ts-node/dist/bin.js:579:5)
+    at Module._compile (node:internal/modules/cjs/loader:1812:14)
+    at Object..js (node:internal/modules/cjs/loader:1943:10) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [
+    '/home/trap/Downloads/9router-master/content-system/n8n/imaginaryUncacheableRequireResolveScript'
+  ]
+}
+
+Node.js v24.14.1
+find: ‘content-system/pipeline’: No such file or directory
+ls: cannot access 'trash/*': No such file or directory
+Workspace tidy‑up complete.
+trap@trap-Latitude-5520:~/Downloads/9router-master$ 
+
+
 
 - provider account cooldown on transient/rate/auth errors
 - account fallback before failing request
