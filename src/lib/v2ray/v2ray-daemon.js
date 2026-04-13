@@ -291,11 +291,10 @@ function buildXrayConfig(nodes) {
 }
 
 function writeXrayConfig(config) {
-  // Write to a temp file first, then use sudo to copy to protected location
   const tempPath = "/tmp/xray-config.json";
   writeFileSync(tempPath, JSON.stringify(config, null, 2));
   try {
-    execSync(`echo 8040 | sudo -S cp ${tempPath} ${XRAY_CONFIG}`, { encoding: "utf8" });
+    execSync(`sudo cp ${tempPath} ${XRAY_CONFIG}`, { encoding: "utf8" });
     log("info", `Xray config written: ${config.inbounds.length} inbounds, ${config.outbounds.length} outbounds`);
   } catch (err) {
     log("error", `Failed to write Xray config: ${err.message}`);
@@ -304,32 +303,29 @@ function writeXrayConfig(config) {
 }
 
 async function reloadXray() {
-  // Backup current config
   try {
-    execSync(`echo 8040 | sudo -S cp ${XRAY_CONFIG} /tmp/xray-config-backup.json`, { encoding: "utf8" });
+    execSync(`sudo cp ${XRAY_CONFIG} /tmp/xray-config-backup.json`, { encoding: "utf8" });
   } catch {}
   
   try {
-    execSync("echo 8040 | sudo -S systemctl restart xray", { encoding: "utf8" });
-    await new Promise(r => setTimeout(r, 3000)); // Wait for startup
+    execSync("sudo systemctl restart xray", { encoding: "utf8" });
+    await new Promise(r => setTimeout(r, 3000));
     
-    // Verify Xray is running
     try {
-      execSync("systemctl is-active xray", { encoding: "utf8" });
+      execSync("sudo systemctl is-active xray", { encoding: "utf8" });
       log("info", "Xray reloaded and running");
       return true;
     } catch {
       log("warn", "Xray didn't start, restoring backup");
-      execSync(`echo 8040 | sudo -S cp /tmp/xray-config-backup.json ${XRAY_CONFIG}`, { encoding: "utf8" });
-      execSync("echo 8040 | sudo -S systemctl restart xray", { encoding: "utf8" });
+      execSync(`sudo cp /tmp/xray-config-backup.json ${XRAY_CONFIG}`, { encoding: "utf8" });
+      execSync("sudo systemctl restart xray", { encoding: "utf8" });
       return false;
     }
   } catch (err) {
     log("error", `Xray reload failed: ${err.message}`);
-    // Restore backup
     try {
-      execSync(`echo 8040 | sudo -S cp /tmp/xray-config-backup.json ${XRAY_CONFIG}`, { encoding: "utf8" });
-      execSync("echo 8040 | sudo -S systemctl restart xray", { encoding: "utf8" });
+      execSync(`sudo cp /tmp/xray-config-backup.json ${XRAY_CONFIG}`, { encoding: "utf8" });
+      execSync("sudo systemctl restart xray", { encoding: "utf8" });
     } catch {}
     return false;
   }
@@ -443,44 +439,55 @@ function assignUniquePools() {
   const db = loadDB();
   const connections = db.providerConnections || [];
   const activeConns = connections.filter(c => c.isActive);
-  const xrayPools = (db.proxyPools || []).filter(p => p.type === "xray" && p.isActive !== false && p.testStatus === "active");
+  const allXrayPools = (db.proxyPools || []).filter(p => p.type === "xray" && p.isActive !== false);
+  const healthyPools = allXrayPools.filter(p => p.testStatus === "active");
 
-  if (xrayPools.length === 0) {
-    log("warn", "No active Xray pools with healthy status to assign");
-    // Fall back to all active xray pools
-    const allXrayPools = (db.proxyPools || []).filter(p => p.type === "xray" && p.isActive !== false);
-    if (allXrayPools.length === 0) return { assigned: 0, failed: activeConns.length, totalConns: activeConns.length, totalPools: 0 };
-    return assignWithPools(allXrayPools, activeConns, db);
+  if (allXrayPools.length === 0) {
+    log("warn", "No active Xray pools to assign");
+    return { assigned: 0, failed: activeConns.length, totalConns: activeConns.length, totalPools: 0 };
   }
 
-  return assignWithPools(xrayPools, activeConns, db);
+  // Pass both sets: use allXrayPools for preserving existing assignments,
+  // prefer healthy pools for new assignments
+  return assignWithPools(allXrayPools, healthyPools, activeConns, db);
 }
 
-function assignWithPools(pools, activeConns, db) {
+function assignWithPools(allPools, healthyPools, activeConns, db) {
   let assigned = 0;
   let failed = 0;
   const usedPoolIds = new Set();
 
   for (const conn of activeConns) {
-    // Clear stale assignment
-    if (conn.providerSpecificData?.proxyPoolId) {
-      const pool = pools.find(p => p.id === conn.providerSpecificData.proxyPoolId);
-      if (pool) { usedPoolIds.add(pool.id); continue; }
-      // Stale pool - clear it
+    const existingPoolId = conn.providerSpecificData?.proxyPoolId;
+
+    if (existingPoolId) {
+      // Keep existing assignment as long as the pool is still active
+      const stillActive = allPools.find(p => p.id === existingPoolId);
+      if (stillActive) {
+        usedPoolIds.add(existingPoolId);
+        continue; // Keep it
+      }
+      // Pool is gone - clear and reassign
       delete conn.providerSpecificData.proxyPoolId;
     }
 
-    // Assign unique pool
-    let pool = pools.find(p => !usedPoolIds.has(p.id));
-    if (!pool) pool = pools[assigned % pools.length]; // Cycle if not enough
+    // Assign a healthy pool (prefer unused, cycle if needed)
+    const available = healthyPools.length > 0 ? healthyPools : allPools;
+    let pool = available.find(p => !usedPoolIds.has(p.id));
+    if (!pool) pool = available[assigned % available.length];
 
-    conn.providerSpecificData = { ...(conn.providerSpecificData || {}), proxyPoolId: pool.id };
-    usedPoolIds.add(pool.id);
-    assigned++;
+    if (pool) {
+      conn.providerSpecificData = { ...(conn.providerSpecificData || {}), proxyPoolId: pool.id };
+      usedPoolIds.add(pool.id);
+      assigned++;
+    } else {
+      failed++;
+    }
   }
 
   saveDB(db);
-  return { assigned, failed: activeConns.length - assigned, totalConns: activeConns.length, totalPools: pools.length };
+  const uniqueUsed = new Set(Object.values(state.poolMap || {}).map(p => p?.poolId)).size;
+  return { assigned, failed: activeConns.length - (activeConns.filter(c => c.providerSpecificData?.proxyPoolId && allPools.find(p => p.id === c.providerSpecificData.proxyPoolId)).length), totalConns: activeConns.length, totalPools: healthyPools.length };
 }
 
 // ─── Main Cycle ─────────────────────────────────────────────────────────────
